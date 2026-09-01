@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import time
 from time import monotonic
 
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
@@ -322,30 +321,6 @@ def admin_decision_kb(order_id: int) -> InlineKeyboardMarkup:
 
 # ---------- User handlers ----------
 @dp.message(CommandStart())
-
-async def send_start_banner(chat_id: int) -> None:
-    """بنر تبلیغاتی قبل از پیام خوش‌آمد — قابل تنظیم از Variables."""
-    if not getattr(config, "START_BANNER_ENABLED", True):
-        return
-    text = (getattr(config, "START_BANNER_TEXT", None) or "").strip()
-    photo = (getattr(config, "START_BANNER_PHOTO_FILE_ID", None) or "").strip()
-    photo_url = (getattr(config, "START_BANNER_PHOTO_URL", None) or "").strip()
-    try:
-        if photo:
-            await bot.send_photo(chat_id, photo=photo, caption=text or None, parse_mode="HTML")
-        elif photo_url:
-            await bot.send_photo(chat_id, photo=photo_url, caption=text or None, parse_mode="HTML")
-        elif text:
-            await bot.send_message(chat_id, text, parse_mode="HTML")
-    except Exception as e:
-        logging.warning(f"send_start_banner failed: {e}")
-        if text:
-            try:
-                await bot.send_message(chat_id, text, parse_mode="HTML")
-            except Exception:
-                pass
-
-
 async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
     await state.clear()
 
@@ -399,8 +374,6 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
         )
         return
 
-    await send_start_banner(message.chat.id)
-
     custom_welcome = await db.get_welcome_message()
     if custom_welcome:
         text = custom_welcome
@@ -429,7 +402,6 @@ async def check_membership_handler(callback: CallbackQuery, state: FSMContext):
             await callback.message.edit_text("✅ عضویت شما تأیید شد! می‌تونید از ربات استفاده کنید.")
         except Exception:
             pass
-        await send_start_banner(callback.from_user.id)
         custom_welcome = await db.get_welcome_message()
         if custom_welcome:
             text = custom_welcome
@@ -985,7 +957,6 @@ def free_test_admin_kb(user_id: int) -> InlineKeyboardMarkup:
     )
 
 
-
 @dp.message(F.text == "🎁 تست رایگان")
 async def free_test_handler(message: Message, state: FSMContext):
     await state.clear()
@@ -999,48 +970,17 @@ async def free_test_handler(message: Message, state: FSMContext):
         status = existing["status"] if existing else "?"
         if status == "pending":
             await message.answer(
-                "⏳ درخواست تست رایگان شما قبلاً ثبت شده و در صف بررسی ادمینه.\nلطفاً صبور باشید.",
-                reply_markup=main_menu_kb(user_id),
-            )
-        elif status == "expired":
-            await message.answer(
-                "❌ تست رایگان قبلی شما تمام شده.\nهر آیدی فقط یک‌بار می‌تونه تست بگیره.",
+                "⏳ درخواست تست رایگان شما قبلاً ثبت شده و در صف بررسی ادمینه.\n"
+                "لطفاً صبور باشید.",
                 reply_markup=main_menu_kb(user_id),
             )
         else:
             await message.answer(
-                "❌ شما قبلاً از تست رایگان استفاده کردید.\nهر آیدی فقط یک‌بار می‌تونه تست رایگان بگیره.",
+                "❌ شما قبلاً از تست رایگان استفاده کردید.\n"
+                "هر آیدی فقط یک‌بار می‌تونه تست رایگان بگیره.",
                 reply_markup=main_menu_kb(user_id),
             )
         return
-
-    # جلوگیری از تست تکراری روی پنل (مثلاً بعد از ریست دیتابیس)
-    if config.is_panel_auto_enabled():
-        try:
-            import panel as pg_panel
-
-            check = await pg_panel.cleanup_duplicate_tests_for_user(user_id)
-            if check.get("active"):
-                await message.answer(
-                    "❌ روی پنل از قبل تست فعال برای این آیدی وجود دارد.\n"
-                    "تست جدید داده نمی‌شود. اگر تمام شده، پس از پاک‌سازی خودکار دوباره امتحان کنید.",
-                    reply_markup=main_menu_kb(user_id),
-                )
-                # ثبت در دیتابیس تا دوباره درخواست ندهد
-                await db.create_free_test_request(
-                    user_id,
-                    message.from_user.username or "",
-                    message.from_user.full_name,
-                )
-                await db.deliver_free_test(
-                    user_id,
-                    "existing panel test",
-                    panel_username=check["active"][0],
-                    test_kind="multi",
-                )
-                return
-        except Exception:
-            logging.exception("panel duplicate check failed")
 
     ok = await db.create_free_test_request(
         user_id,
@@ -1054,83 +994,105 @@ async def free_test_handler(message: Message, state: FSMContext):
         )
         return
 
-    if not config.is_panel_auto_enabled():
-        await message.answer(
-            "✅ درخواست تست رایگان شما ثبت شد.\nمنتظر بررسی ادمین باشید.",
-            reply_markup=main_menu_kb(user_id),
-        )
-        for admin_id in config.ADMIN_IDS:
-            try:
-                await bot.send_message(
-                    admin_id,
-                    f"🎁 درخواست تست\n👤 {message.from_user.full_name}\n🆔 <code>{user_id}</code>",
-                    parse_mode="HTML",
-                    reply_markup=free_test_admin_kb(user_id),
-                )
-            except Exception as e:
-                logging.warning(f"notify admin: {e}")
-        return
-
-    wait_msg = await message.answer("⏳ در حال ساخت تست رایگان...")
-    try:
-        import panel as pg_panel
-
-        result = await pg_panel.create_test_account(user_id)
-        await db.deliver_free_test(
-            user_id,
-            result["message"],
-            panel_username=result.get("username"),
-            test_kind=result.get("kind") or "multi",
-            expire_at=result.get("expire_at"),
-        )
+    # ---- حالت خودکار: ساخت روی پنل پاسارگارد ----
+    if config.is_panel_auto_enabled():
+        wait_msg = await message.answer("⏳ در حال ساخت تست رایگان...")
         try:
-            await wait_msg.delete()
-        except Exception:
-            pass
+            import panel as pg_panel
 
-        sub_url = (result.get("subscription_url") or "").strip()
-        if sub_url:
+            result = await pg_panel.create_test_account(user_id)
+            await db.deliver_free_test(user_id, result["message"])
             try:
-                from aiogram.types import BufferedInputFile
+                await wait_msg.delete()
+            except Exception:
+                pass
 
-                qr_bytes = pg_panel.make_qr_png(sub_url)
-                caption = result["message"]
-                if len(caption) > 1024:
-                    caption = caption[:1000].rstrip() + "…"
-                await message.answer_photo(
-                    BufferedInputFile(qr_bytes, filename="qr.png"),
-                    caption=caption,
+            sub_url = (result.get("subscription_url") or "").strip()
+            # متن + QR در یک پیام (عکس با کپشن) — نه جداگانه
+            if sub_url:
+                try:
+                    from aiogram.types import BufferedInputFile
+
+                    qr_bytes = pg_panel.make_qr_png(sub_url)
+                    caption = result["message"]
+                    if len(caption) > 1024:
+                        caption = caption[:1000].rstrip() + "…"
+                    await message.answer_photo(
+                        BufferedInputFile(qr_bytes, filename="qr.png"),
+                        caption=caption,
+                        reply_markup=main_menu_kb(user_id),
+                    )
+                except Exception as qr_err:
+                    logging.warning(f"QR send failed, fallback to text: {qr_err}")
+                    await message.answer(
+                        result["message"],
+                        reply_markup=main_menu_kb(user_id),
+                        disable_web_page_preview=True,
+                    )
+            else:
+                await message.answer(
+                    result["message"],
+                    reply_markup=main_menu_kb(user_id),
+                    disable_web_page_preview=True,
+                )
+            # اطلاع به ادمین: آیدی کسی که تست گرفته
+            admin_text = (
+                f"🎁 تست رایگان گرفته شد\n"
+                f"👤 {message.from_user.full_name}\n"
+                f"🆔 آیدی عددی: <code>{user_id}</code>\n"
+                f"🔗 یوزرنیم: @{message.from_user.username or '-'}\n"
+                f"🔑 اکانت پنل: <code>{result.get('username') or '-'}</code>"
+            )
+            for admin_id in config.ADMIN_IDS:
+                try:
+                    await bot.send_message(admin_id, admin_text, parse_mode="HTML")
+                except Exception as e:
+                    logging.warning(f"Could not notify admin {admin_id} about free test: {e}")
+        except Exception as e:
+            logging.exception("Auto free-test panel error")
+            await db.set_free_test_status(user_id, "rejected")
+            try:
+                await wait_msg.edit_text(
+                    "❌ ساخت تست با خطا مواجه شد. لطفاً بعداً دوباره تلاش کنید یا با پشتیبانی در ارتباط باشید."
+                )
+            except Exception:
+                await message.answer(
+                    "❌ ساخت تست با خطا مواجه شد. لطفاً بعداً دوباره تلاش کنید یا با پشتیبانی در ارتباط باشید.",
                     reply_markup=main_menu_kb(user_id),
                 )
-            except Exception as qr_err:
-                logging.warning(f"QR send failed: {qr_err}")
-                await message.answer(
-                    result["message"], reply_markup=main_menu_kb(user_id), disable_web_page_preview=True
-                )
-        else:
-            await message.answer(
-                result["message"], reply_markup=main_menu_kb(user_id), disable_web_page_preview=True
-            )
+            for admin_id in config.ADMIN_IDS:
+                try:
+                    await bot.send_message(
+                        admin_id,
+                        f"⚠️ خطا در ساخت تست خودکار برای <code>{user_id}</code>:\n<code>{e}</code>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+        return
 
-        admin_text = (
-            f"🎁 تست رایگان گرفته شد\n"
-            f"👤 {message.from_user.full_name}\n"
-            f"🆔 <code>{user_id}</code>\n"
-            f"🔗 @{message.from_user.username or '-'}\n"
-            f"🔑 <code>{result.get('username') or '-'}</code>"
-        )
-        for admin_id in config.ADMIN_IDS:
-            try:
-                await bot.send_message(admin_id, admin_text, parse_mode="HTML")
-            except Exception as e:
-                logging.warning(f"notify admin: {e}")
-    except Exception:
-        logging.exception("Auto free-test panel error")
-        await db.set_free_test_status(user_id, "rejected")
+    # ---- حالت دستی: درخواست برای ادمین ----
+    await message.answer(
+        "✅ درخواست تست رایگان شما ثبت شد.\n"
+        "به‌محض بررسی توسط ادمین، اطلاعات تست براتون ارسال می‌شه.",
+        reply_markup=main_menu_kb(user_id),
+    )
+
+    caption = (
+        f"🎁 درخواست تست رایگان\n"
+        f"👤 کاربر: {message.from_user.full_name} (@{message.from_user.username or '-'})\n"
+        f"🆔 آیدی عددی: <code>{user_id}</code>"
+    )
+    for admin_id in config.ADMIN_IDS:
         try:
-            await wait_msg.edit_text("❌ ساخت تست با خطا مواجه شد. بعداً دوباره تلاش کنید.")
-        except Exception:
-            await message.answer("❌ ساخت تست با خطا مواجه شد.", reply_markup=main_menu_kb(user_id))
+            await bot.send_message(
+                admin_id,
+                caption,
+                parse_mode="HTML",
+                reply_markup=free_test_admin_kb(user_id),
+            )
+        except Exception as e:
+            logging.warning(f"Could not notify admin {admin_id} about free test: {e}")
 
 
 @dp.callback_query(F.data.startswith("ftapprove:"))
@@ -2902,111 +2864,6 @@ async def admin_all_pending(message: Message):
     )
 
 
-
-
-
-async def run_free_test_cleanup_once() -> int:
-    """تست‌هایی که حجم/زمان‌شان تمام شده را پیدا می‌کند و فقط به ادمین اطلاع می‌دهد."""
-    if not config.is_panel_auto_enabled():
-        return 0
-    import panel as pg_panel
-
-    rows = await db.list_delivered_free_tests_for_cleanup()
-    notified = 0
-    now = int(time.time())
-    hours = int(getattr(config, "PASARGUARD_TEST_EXPIRE_HOURS", 48) or 48)
-
-    for row in rows or []:
-        try:
-            uname = row["panel_username"] if "panel_username" in row.keys() else None
-            if not uname:
-                continue
-            uid = int(row["user_id"])
-            local_exp = None
-            raw_exp = row["expire_at"] if "expire_at" in row.keys() else None
-            try:
-                if raw_exp is not None and str(raw_exp).strip() != "":
-                    local_exp = int(raw_exp)
-            except (TypeError, ValueError):
-                local_exp = None
-            if not local_exp:
-                delivered = row["delivered_at"] if "delivered_at" in row.keys() else None
-                if delivered:
-                    try:
-                        from datetime import datetime
-
-                        dt = datetime.fromisoformat(str(delivered))
-                        local_exp = int(dt.timestamp()) + hours * 3600
-                    except Exception:
-                        pass
-
-            info = None
-            try:
-                info = await pg_panel.get_panel_user(uname)
-            except Exception:
-                logging.exception("cleanup get_panel_user %s", uname)
-
-            force_time = bool(local_exp and local_exp > 0 and now >= local_exp)
-            done, reason = pg_panel.is_panel_user_exhausted(info, local_exp)
-            if force_time:
-                done, reason = True, "زمان"
-            if not done:
-                continue
-
-            # فقط علامت بزن که دوباره پیام نده + اطلاع به ادمین
-            await db.mark_free_test_expired(uid, reason or "زمان")
-            notified += 1
-
-            kind = (row["test_kind"] if "test_kind" in row.keys() else None) or "-"
-            full_name = (row["full_name"] if "full_name" in row.keys() else None) or "-"
-            tg_user = (row["username"] if "username" in row.keys() else None) or "-"
-            lines = [
-                "⏰ تست رایگان تمام شد",
-                f"📦 دلیل: <b>{reason}</b>",
-                f"👤 {full_name}",
-                f"🆔 <code>{uid}</code>",
-                f"🔗 @{tg_user}",
-                f"🔑 پنل: <code>{uname}</code>",
-                f"نوع: {kind}",
-            ]
-            text_msg = "\n".join(lines)
-            for admin_id in config.ADMIN_IDS:
-                try:
-                    await bot.send_message(admin_id, text_msg, parse_mode="HTML")
-                except Exception as e:
-                    logging.warning("notify expired test: %s", e)
-        except Exception:
-            logging.exception("cleanup row failed")
-    return notified
-
-
-async def free_test_cleanup_loop() -> None:
-    """هر چند دقیقه تست‌های تمام‌شده را چک و به ادمین اطلاع می‌دهد."""
-    await asyncio.sleep(30)
-    interval = int(getattr(config, "FREE_TEST_CLEANUP_INTERVAL_SEC", 300) or 300)
-    while True:
-        try:
-            n = await run_free_test_cleanup_once()
-            if n:
-                logging.info("notified %s expired free tests", n)
-        except Exception:
-            logging.exception("free_test_cleanup_loop error")
-        await asyncio.sleep(max(60, interval))
-
-
-@dp.message(Command("cleanup_tests"))
-async def admin_cleanup_tests_cmd(message: Message):
-    if message.from_user.id not in config.ADMIN_IDS:
-        return
-    await message.answer("⏳ در حال بررسی تست‌های تمام‌شده...")
-    try:
-        n = await run_free_test_cleanup_once()
-        await message.answer(f"✅ بررسی شد. تعداد تمام‌شده: {n}")
-    except Exception as e:
-        logging.exception("manual cleanup")
-        await message.answer(f"❌ خطا: {e}")
-
-
 # ---------- Startup ----------
 async def main():
     global BOT_USERNAME
@@ -3022,7 +2879,6 @@ async def main():
     BOT_USERNAME = me.username
     logging.info(f"Bot started as @{BOT_USERNAME}")
 
-    asyncio.create_task(free_test_cleanup_loop())
     await dp.start_polling(bot)
 
 
