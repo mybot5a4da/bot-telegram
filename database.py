@@ -176,6 +176,18 @@ async def init_db():
         )
         await db.commit()
 
+        # ستون‌های تست: نام پنل، نوع، انقضا
+        for col_sql in (
+            "ALTER TABLE free_tests ADD COLUMN panel_username TEXT",
+            "ALTER TABLE free_tests ADD COLUMN test_kind TEXT",
+            "ALTER TABLE free_tests ADD COLUMN expire_at INTEGER",
+        ):
+            try:
+                await db.execute(col_sql)
+                await db.commit()
+            except Exception:
+                pass
+
         # مهاجرت: ستون payment_method به جدول orders (برای دیتابیس‌های قدیمی‌تر که این ستون رو ندارن)
         try:
             await db.execute("ALTER TABLE orders ADD COLUMN payment_method TEXT DEFAULT 'receipt'")
@@ -868,7 +880,7 @@ async def has_claimed_free_test(user_id: int) -> bool:
     """آیا این کاربر قبلاً تست رایگان گرفته (pending/delivered)؟"""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT 1 FROM free_tests WHERE user_id = ? AND status IN ('pending', 'delivered')",
+            "SELECT 1 FROM free_tests WHERE user_id = ? AND status IN ('pending', 'delivered', 'expired')",
             (user_id,),
         )
         return await cursor.fetchone() is not None
@@ -881,7 +893,7 @@ async def create_free_test_request(user_id: int, username: str, full_name: str) 
             "SELECT status FROM free_tests WHERE user_id = ?", (user_id,)
         )
         row = await cursor.fetchone()
-        if row and row[0] in ("pending", "delivered"):
+        if row and row[0] in ("pending", "delivered", "expired"):
             return False
         # اگه rejected بوده یا اصلاً نبوده، upsert می‌کنیم
         await db.execute(
@@ -915,15 +927,53 @@ async def set_free_test_status(user_id: int, status: str) -> None:
         await db.commit()
 
 
-async def deliver_free_test(user_id: int, panel_info: str) -> None:
+async def deliver_free_test(
+    user_id: int,
+    panel_info: str,
+    panel_username: str | None = None,
+    test_kind: str | None = None,
+    expire_at: int | None = None,
+) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            """UPDATE free_tests SET status = 'delivered', panel_info = ?, delivered_at = ?
+            """UPDATE free_tests SET status = 'delivered', panel_info = ?, delivered_at = ?,
+                   panel_username = COALESCE(?, panel_username),
+                   test_kind = COALESCE(?, test_kind),
+                   expire_at = COALESCE(?, expire_at)
                WHERE user_id = ?""",
-            (panel_info, datetime.now().isoformat(), user_id),
+            (
+                panel_info,
+                datetime.now().isoformat(),
+                panel_username,
+                test_kind,
+                expire_at,
+                user_id,
+            ),
         )
         await db.commit()
 
+
+async def list_delivered_free_tests_for_cleanup():
+    """تست‌های تحویل‌شده که هنوز منقضی/پاک نشده‌اند."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT * FROM free_tests
+               WHERE status = 'delivered' AND panel_username IS NOT NULL AND panel_username != ''"""
+        )
+        return await cur.fetchall()
+
+
+async def mark_free_test_expired(user_id: int, reason: str = "") -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        suffix = f"[expired:{reason}]" if reason else "[expired]"
+        await db.execute(
+            """UPDATE free_tests SET status = 'expired',
+                   panel_info = COALESCE(panel_info, '') || ?
+               WHERE user_id = ?""",
+            (suffix, user_id),
+        )
+        await db.commit()
 
 async def get_orders_report() -> dict:
     """آمار کلی سفارش‌ها برای پنل ادمین."""
