@@ -1100,53 +1100,44 @@ async def free_test_handler(message: Message, state: FSMContext):
         except Exception:
             pass
 
-        # ارسال به کاربر — QR اولویت دارد
+        # متن + QR در یک پیام (عکس با کپشن)
         text = (result.get("message") or "✅ تست آماده شد").strip()
         sub_url = (result.get("subscription_url") or "").strip()
         kb = delivery_extra_kb(sub_url or None)
         sent_text = False
         sent_qr = False
 
-        # 1) متن را اول بفرست (حتی اگر QR بعداً خطا بدهد، پیام را دارد)
-        try:
-            kwargs = {"disable_web_page_preview": True}
-            if kb is not None:
-                kwargs["reply_markup"] = kb
-            await message.answer(text, **kwargs)
-            sent_text = True
-        except Exception as e:
-            logging.warning("send text failed: %s", e)
-            try:
-                await message.answer(text[:4000], disable_web_page_preview=True)
-                sent_text = True
-            except Exception:
-                logging.exception("send text fallback failed")
-
-        # 2) QR جداگانه — خیلی مهم
         if sub_url:
             try:
                 from aiogram.types import BufferedInputFile
 
                 qr_bytes = pm.make_qr_png(sub_url)
+                caption = text if len(text) <= 1024 else text[:1000].rstrip() + "…"
+                kwargs = {"caption": caption}
+                if kb is not None:
+                    kwargs["reply_markup"] = kb
                 await message.answer_photo(
                     BufferedInputFile(qr_bytes, filename="qr.png"),
-                    caption="📱 کد QR اتصال — با اسکنر داخل اپ باز کنید",
+                    **kwargs,
                 )
+                sent_text = True
                 sent_qr = True
-            except Exception as e1:
-                logging.warning("QR photo failed: %s", e1)
-                # تلاش دوم: فایل document
-                try:
-                    from aiogram.types import BufferedInputFile
+            except Exception as e:
+                logging.warning("photo+caption failed: %s", e)
 
-                    qr_bytes = pm.make_qr_png(sub_url)
-                    await message.answer_document(
-                        BufferedInputFile(qr_bytes, filename="qr_config.png"),
-                        caption="📱 کد QR اتصال",
-                    )
-                    sent_qr = True
-                except Exception as e2:
-                    logging.exception("QR document also failed: %s", e2)
+        if not sent_text:
+            try:
+                kwargs = {"disable_web_page_preview": True}
+                if kb is not None:
+                    kwargs["reply_markup"] = kb
+                await message.answer(text, **kwargs)
+                sent_text = True
+            except Exception:
+                try:
+                    await message.answer(text[:4000], disable_web_page_preview=True)
+                    sent_text = True
+                except Exception:
+                    logging.exception("text deliver failed")
 
         try:
             await message.answer("از منوی زیر می‌توانید ادامه دهید:", reply_markup=main_menu_kb(user_id))
