@@ -1083,13 +1083,18 @@ async def free_test_handler(message: Message, state: FSMContext):
 
         result = await pm.create_test_account(user_id)
         # اول در دیتابیس delivered کن تا اگر ارسال تلگرام خطا داد، دوباره «در صف» نماند
-        await db.deliver_free_test(
-            user_id,
-            result.get("message") or "",
-            panel_username=result.get("username"),
-            test_kind=result.get("kind") or "multi",
-            expire_at=result.get("expire_at"),
-        )
+        _msg = result.get("message") or ""
+        try:
+            await db.deliver_free_test(
+                user_id,
+                _msg,
+                panel_username=result.get("username"),
+                test_kind=result.get("kind") or "multi",
+                expire_at=result.get("expire_at"),
+            )
+        except TypeError:
+            # database.py قدیمی بدون آرگومان‌های اضافه
+            await db.deliver_free_test(user_id, _msg)
         try:
             await wait_msg.delete()
         except Exception:
