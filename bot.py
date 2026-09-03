@@ -350,11 +350,7 @@ def admin_decision_kb(order_id: int) -> InlineKeyboardMarkup:
 
 
 async def _panel_ready() -> bool:
-    try:
-        import panel_manager as pm
-        return await pm.is_panel_ready()
-    except Exception:
-        return bool(config.is_panel_auto_enabled())
+    return bool(config.is_panel_auto_enabled())
 
 
 # ---------- User handlers ----------
@@ -1083,7 +1079,7 @@ async def free_test_handler(message: Message, state: FSMContext):
 
     wait_msg = await message.answer("⏳ در حال ساخت تست رایگان...")
     try:
-        import panel_manager as pm
+        import panel as pm
 
         result = await pm.create_test_account(user_id)
         # اول در دیتابیس delivered کن تا اگر ارسال تلگرام خطا داد، دوباره «در صف» نماند
@@ -1099,42 +1095,54 @@ async def free_test_handler(message: Message, state: FSMContext):
         except Exception:
             pass
 
-        # ارسال به کاربر — خطا اینجا دیگر کل تست را reject نمی‌کند
+        # ارسال به کاربر — QR اولویت دارد
         text = (result.get("message") or "✅ تست آماده شد").strip()
         sub_url = (result.get("subscription_url") or "").strip()
         kb = delivery_extra_kb(sub_url or None)
-        sent = False
+        sent_text = False
+        sent_qr = False
+
+        # 1) متن را اول بفرست (حتی اگر QR بعداً خطا بدهد، پیام را دارد)
+        try:
+            kwargs = {"disable_web_page_preview": True}
+            if kb is not None:
+                kwargs["reply_markup"] = kb
+            await message.answer(text, **kwargs)
+            sent_text = True
+        except Exception as e:
+            logging.warning("send text failed: %s", e)
+            try:
+                await message.answer(text[:4000], disable_web_page_preview=True)
+                sent_text = True
+            except Exception:
+                logging.exception("send text fallback failed")
+
+        # 2) QR جداگانه — خیلی مهم
         if sub_url:
             try:
                 from aiogram.types import BufferedInputFile
 
                 qr_bytes = pm.make_qr_png(sub_url)
-                caption = text if len(text) <= 1024 else text[:1000].rstrip() + "…"
-                kwargs = {"caption": caption}
-                if kb is not None:
-                    kwargs["reply_markup"] = kb
                 await message.answer_photo(
                     BufferedInputFile(qr_bytes, filename="qr.png"),
-                    **kwargs,
+                    caption="📱 کد QR اتصال — با اسکنر داخل اپ باز کنید",
                 )
-                sent = True
-            except Exception as qr_err:
-                logging.warning("QR/photo send failed: %s", qr_err)
-        if not sent:
-            try:
-                kwargs = {"disable_web_page_preview": True}
-                if kb is not None:
-                    kwargs["reply_markup"] = kb
-                await message.answer(text, **kwargs)
-                sent = True
-            except Exception as send_err:
-                logging.exception("text deliver failed: %s", send_err)
-                # آخرین تلاش بدون کیبورد
+                sent_qr = True
+            except Exception as e1:
+                logging.warning("QR photo failed: %s", e1)
+                # تلاش دوم: فایل document
                 try:
-                    await message.answer(text[:4000], disable_web_page_preview=True)
-                    sent = True
-                except Exception:
-                    pass
+                    from aiogram.types import BufferedInputFile
+
+                    qr_bytes = pm.make_qr_png(sub_url)
+                    await message.answer_document(
+                        BufferedInputFile(qr_bytes, filename="qr_config.png"),
+                        caption="📱 کد QR اتصال",
+                    )
+                    sent_qr = True
+                except Exception as e2:
+                    logging.exception("QR document also failed: %s", e2)
+
         try:
             await message.answer("از منوی زیر می‌توانید ادامه دهید:", reply_markup=main_menu_kb(user_id))
         except Exception:
@@ -1146,22 +1154,14 @@ async def free_test_handler(message: Message, state: FSMContext):
             f"🆔 <code>{user_id}</code>\n"
             f"🔗 @{message.from_user.username or '-'}\n"
             f"🔑 <code>{result.get('username') or '-'}</code>\n"
-            f"📤 ارسال به کاربر: {'✅' if sent else '❌ ناموفق — دستی بفرست'}"
+            f"📝 متن: {'✅' if sent_text else '❌'}\n"
+            f"📱 QR: {'✅' if sent_qr else ('❌' if sub_url else '— بدون لینک ساب')}"
         )
         for admin_id in config.ADMIN_IDS:
             try:
                 await bot.send_message(admin_id, admin_text, parse_mode="HTML")
             except Exception as e:
                 logging.warning(f"notify admin: {e}")
-        if not sent:
-            # به ادمین خود متن تست را هم بده
-            try:
-                await bot.send_message(
-                    config.ADMIN_IDS[0],
-                    f"متن تست برای ارسال دستی به {user_id}:\n\n{text[:3500]}",
-                )
-            except Exception:
-                pass
     except Exception as e:
         logging.exception("Auto free-test panel error")
         await db.set_free_test_status(user_id, "rejected")
@@ -3101,7 +3101,7 @@ async def admin_cleanup_tests_cmd(message: Message):
 
 # ---------- Admin: ثبت پنل ----------
 def _panel_type_kb() -> InlineKeyboardMarkup:
-    import panel_manager as pm
+    import panel as pm
     rows = [
         [InlineKeyboardButton(text=label, callback_data=f"adminpanel:type:{key}")]
         for key, label in pm.PANEL_TYPE_LABELS.items()
@@ -3111,7 +3111,7 @@ def _panel_type_kb() -> InlineKeyboardMarkup:
 
 
 async def _panels_menu_kb() -> InlineKeyboardMarkup:
-    import panel_manager as pm
+    import panel as pm
     panels = await db.list_panels(active_only=False)
     rows = [[InlineKeyboardButton(text="➕ افزودن پنل جدید", callback_data="adminpanel:add")]]
     for p in panels:
@@ -3276,7 +3276,7 @@ async def admin_panel_view(callback: CallbackQuery, state: FSMContext):
     if not p:
         await callback.answer("پیدا نشد", show_alert=True)
         return
-    import panel_manager as pm
+    import panel as pm
     label = pm.PANEL_TYPE_LABELS.get(p["panel_type"], p["panel_type"])
     text = (
         f"🖥 <b>{p['name']}</b>\n"
@@ -3300,7 +3300,7 @@ async def admin_panel_default(callback: CallbackQuery):
     await callback.answer("پیش‌فرض شد ✅", show_alert=True)
     p = await db.get_panel(pid)
     if p:
-        import panel_manager as pm
+        import panel as pm
         label = pm.PANEL_TYPE_LABELS.get(p["panel_type"], p["panel_type"])
         await callback.message.edit_text(
             f"🖥 <b>{p['name']}</b>\nنوع: {label}\n⭐ پیش‌فرض فعال شد",
@@ -3339,7 +3339,7 @@ async def admin_panel_test(callback: CallbackQuery):
         return
     pid = int(callback.data.split(":")[2])
     await callback.answer()
-    import panel_manager as pm
+    import panel as pm
     msg = await pm.test_panel_connection(pid)
     await callback.message.answer(msg)
 
