@@ -922,13 +922,17 @@ async def receive_receipt(message: Message, state: FSMContext):
     )
     await state.clear()
 
+    is_renew = "شارژ مجدد" in str(order["plan_name"] or "")
+    head = "🔋 رسید شارژ مجدد" if is_renew else "🆕 سفارش جدید"
     caption = (
-        f"🆕 سفارش جدید #{order_id}\n"
+        f"{head} #{order_id}\n"
         f"👤 کاربر: {order['full_name']} (@{order['username'] or '-'})\n"
         f"🆔 آیدی عددی: {order['user_id']}\n"
         f"📦 پلن: {order['plan_name']}\n"
         f"💰 مبلغ: {order['price']:,} تومان"
     )
+    if is_renew:
+        caption += "\n\nپس از تأیید شما، ربات سرویس جدید می‌سازد و با QR تحویل می‌دهد."
 
     for admin_id in config.ADMIN_IDS:
         try:
@@ -974,23 +978,47 @@ def my_orders_kb(orders) -> InlineKeyboardMarkup:
     rows = []
     for o in orders:
         icon = ORDER_STATUS_ICON.get(o["status"], "•")
+        name = (o["plan_name"] or "")[:40]
+        if o["status"] == "delivered":
+            try:
+                if o["expired_notified"]:
+                    icon = "🔴"
+                    name = "تمام‌شده | " + name
+            except Exception:
+                pass
         rows.append(
-            [InlineKeyboardButton(text=f"{icon} #{o['id']} - {o['plan_name']}", callback_data=f"vieworder:{o['id']}")]
+            [InlineKeyboardButton(text=f"{icon} #{o['id']} - {name}", callback_data=f"vieworder:{o['id']}")]
         )
     rows.append([InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def order_detail_text(order) -> str:
+    status = order["status"]
+    expired = False
+    try:
+        expired = bool(order["expired_notified"])
+    except Exception:
+        expired = False
+    if status == "delivered" and expired:
+        status_txt = "🔴 سرویس تمام شده — نیاز به شارژ"
+    else:
+        status_txt = ORDER_STATUS_MAP.get(status, status)
     text = (
         f"🆔 <b>سفارش #{order['id']}</b>\n"
         f"—————————————\n"
         f"📦 پلن: {order['plan_name']}\n"
         f"💰 مبلغ: {order['price']:,} تومان\n"
-        f"📌 وضعیت: {ORDER_STATUS_MAP.get(order['status'], order['status'])}"
+        f"📌 وضعیت: {status_txt}"
     )
-    if order["status"] == "delivered" and order["panel_info"]:
+    if status == "delivered" and order["panel_info"] and not expired:
         text += f"\n\n🔑 اطلاعات و کانفیگ سرویس:\n{order['panel_info']}"
+    if status == "delivered" and expired:
+        text += (
+            "\n\n⚠️ این سرویس تمام شده است.\n"
+            "دکمه «🔋 شارژ مجدد» را بزنید، پرداخت کنید و رسید بفرستید "
+            "تا سرویس جدید با QR برایتان ساخته شود."
+        )
     return text
 
 
@@ -1002,11 +1030,13 @@ async def my_orders(message: Message, state: FSMContext):
         return
     orders = await db.get_user_orders(message.from_user.id)
     if not orders:
-        await message.answer("شما هنوز هیچ سفارشی ثبت نکردید.", reply_markup=back_menu_kb())
+        await message.answer(
+            "شما هنوز هیچ سفارشی ثبت نکردید.\nاز «🛍️ خرید سرویس» یک سرویس بگیرید.",
+            reply_markup=back_menu_kb(),
+        )
         return
-
     await message.answer(
-        "🖥 <b>سرویس‌های من</b>\nبرای مشاهده اطلاعات و کانفیگ هر سفارش، روی اون کلیک کنید:",
+        "🛒 <b>سرویس‌های من</b>\nروی هر سفارش بزنید. اگر تمام شده باشد می‌توانید شارژ مجدد کنید.",
         parse_mode="HTML",
         reply_markup=my_orders_kb(orders),
     )
@@ -1019,12 +1049,65 @@ async def view_order_detail(callback: CallbackQuery):
     if not order or order["user_id"] != callback.from_user.id:
         await callback.answer("این سفارش پیدا نشد.", show_alert=True)
         return
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🔙 بازگشت به لیست سرویس‌ها", callback_data="myorders:list")]]
-    )
+    rows = []
+    if order["status"] == "delivered":
+        rows.append([InlineKeyboardButton(text="🔋 شارژ مجدد همین پلن", callback_data=f"renew:{order_id}")])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت به لیست سرویس‌ها", callback_data="myorders:list")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     await callback.message.edit_text(order_detail_text(order), parse_mode="HTML", reply_markup=kb)
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("renew:"))
+async def renew_service(callback: CallbackQuery, state: FSMContext):
+    order_id = int(callback.data.split(":")[1])
+    old = await db.get_order(order_id)
+    if not old or old["user_id"] != callback.from_user.id:
+        await callback.answer("سفارش پیدا نشد.", show_alert=True)
+        return
+    if old["status"] != "delivered":
+        await callback.answer("فقط سرویس تحویل‌شده قابل شارژ است.", show_alert=True)
+        return
+    base_name = old["plan_name"] or "سرویس"
+    if not str(base_name).startswith("🔋"):
+        plan_name = f"🔋 شارژ مجدد - {base_name}"
+    else:
+        plan_name = base_name
+    new_id = await db.create_order(
+        user_id=callback.from_user.id,
+        username=callback.from_user.username or "",
+        full_name=callback.from_user.full_name,
+        plan_id=old["plan_id"],
+        plan_name=plan_name,
+        price=old["price"],
+    )
+    await state.clear()
+    order = await db.get_order(new_id)
+    await callback.message.edit_text(
+        "🔋 <b>شارژ مجدد</b>\n\n"
+        + order_summary_text(order)
+        + "\n\nپس از پرداخت، رسید را ارسال کنید تا سرویس جدید ساخته شود.",
+        parse_mode="HTML",
+        reply_markup=await build_order_summary_kb(order),
+    )
+    for admin_id in config.ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                (
+                    f"🔋 <b>درخواست شارژ مجدد</b>\n"
+                    f"👤 {callback.from_user.full_name} (@{callback.from_user.username or '-'})\n"
+                    f"🆔 <code>{callback.from_user.id}</code>\n"
+                    f"📦 {plan_name}\n"
+                    f"💰 {old['price']:,} تومان\n"
+                    f"🆕 سفارش #{new_id} (قبلی #{order_id})\n\n"
+                    f"منتظر رسید است؛ بعد از تأیید شما سرویس جدید ساخته می‌شود."
+                ),
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logging.warning(f"notify admin renew: {e}")
+    await callback.answer("سفارش شارژ ساخته شد")
 
 
 @dp.callback_query(F.data == "myorders:list")
@@ -3056,7 +3139,13 @@ async def admin_approve(callback: CallbackQuery, state: FSMContext):
                 duration_label=spec.get("duration_label"),
                 hwid_limit=spec.get("hwid_limit"),
             )
-            await db.deliver_order(order_id, result["message"])
+            await db.deliver_order(
+                order_id,
+                result["message"],
+                panel_username=result.get("username"),
+                subscription_url=result.get("subscription_url"),
+                expire_at=result.get("expire_at"),
+            )
             await _send_service_to_user(
                 order["user_id"],
                 result["message"],
@@ -3270,6 +3359,96 @@ async def run_free_test_cleanup_once() -> int:
         except Exception:
             logging.exception("cleanup row failed")
     return notified
+
+
+
+async def run_service_watch_once() -> None:
+    """هشدار حجم کم و اطلاع تمام‌شدن سرویس به کاربر و ادمین."""
+    if not config.is_panel_auto_enabled():
+        return
+    try:
+        import panel as pg
+    except Exception:
+        return
+    warn_gb = float(getattr(config, "SERVICE_WARN_REMAINING_GB", 1.0) or 1.0)
+    rows = await db.list_delivered_orders_for_watch()
+    for row in rows:
+        try:
+            order = dict(row)
+        except Exception:
+            order = row
+        uname = order.get("panel_username") if isinstance(order, dict) else None
+        if not uname:
+            continue
+        oid = order["id"]
+        uid = order["user_id"]
+        info = await pg.get_panel_user(uname)
+        local_exp = order.get("expire_at")
+        done, reason = pg.is_panel_user_exhausted(info, local_exp)
+        if done:
+            await db.mark_order_expired_notified(oid)
+            try:
+                await bot.send_message(
+                    uid,
+                    f"🔴 سرویس سفارش #{oid} تمام شد ({reason}).\n"
+                    f"📦 {order.get('plan_name') or ''}\n\n"
+                    f"از «🛒 سرویس‌های من» → شارژ مجدد بزنید و بعد از پرداخت، سرویس جدید بگیرید.",
+                )
+            except Exception as e:
+                logging.warning("notify user expired: %s", e)
+            for admin_id in config.ADMIN_IDS:
+                try:
+                    await bot.send_message(
+                        admin_id,
+                        f"🔴 سرویس تمام شد — لطفاً از پنل حذف کنید\n"
+                        f"👤 user <code>{uid}</code>\n"
+                        f"🆔 order #{oid}\n"
+                        f"🔑 <code>{uname}</code>\n"
+                        f"دلیل: {reason}",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+            continue
+
+        left = pg.remaining_traffic_gb(info)
+        if left is None or left > warn_gb:
+            continue
+        if order.get("last_warn_at"):
+            continue
+        await db.mark_order_warned(oid)
+        try:
+            await bot.send_message(
+                uid,
+                f"⚠️ هشدار: از سرویس سفارش #{oid} حدود <b>{left:.2f} گیگ</b> مانده.\n"
+                f"قبل از اتمام، از «🛒 سرویس‌های من» شارژ مجدد کنید.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        for admin_id in config.ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"⚠️ سرویس رو به اتمام\n"
+                    f"👤 <code>{uid}</code> | order #{oid}\n"
+                    f"🔑 <code>{uname}</code>\n"
+                    f"باقیمانده ≈ {left:.2f} گیگ",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+
+async def service_watch_loop() -> None:
+    await asyncio.sleep(45)
+    interval = int(getattr(config, "SERVICE_WATCH_INTERVAL_SEC", 600) or 600)
+    while True:
+        try:
+            await run_service_watch_once()
+        except Exception:
+            logging.exception("service_watch_loop")
+        await asyncio.sleep(max(120, interval))
 
 
 async def free_test_cleanup_loop() -> None:

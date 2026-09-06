@@ -241,12 +241,20 @@ async def init_db():
         )
         await db.commit()
 
-        # مهاجرت: ستون payment_method به جدول orders (برای دیتابیس‌های قدیمی‌تر که این ستون رو ندارن)
-        try:
-            await db.execute("ALTER TABLE orders ADD COLUMN payment_method TEXT DEFAULT 'receipt'")
-            await db.commit()
-        except Exception:
-            pass  # ستون از قبل وجود داره
+        # مهاجرت: ستون‌های orders
+        for _col in (
+            "ALTER TABLE orders ADD COLUMN payment_method TEXT DEFAULT 'receipt'",
+            "ALTER TABLE orders ADD COLUMN panel_username TEXT",
+            "ALTER TABLE orders ADD COLUMN subscription_url TEXT",
+            "ALTER TABLE orders ADD COLUMN expire_at INTEGER",
+            "ALTER TABLE orders ADD COLUMN last_warn_at TEXT",
+            "ALTER TABLE orders ADD COLUMN expired_notified INTEGER DEFAULT 0",
+        ):
+            try:
+                await db.execute(_col)
+                await db.commit()
+            except Exception:
+                pass
 
         # مهاجرت: ستون‌های کد تخفیف روی orders
         try:
@@ -361,11 +369,21 @@ async def set_order_status(order_id, status):
         await db.commit()
 
 
-async def deliver_order(order_id, panel_info):
+async def deliver_order(
+    order_id,
+    panel_info,
+    panel_username: str | None = None,
+    subscription_url: str | None = None,
+    expire_at: int | None = None,
+):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE orders SET status = 'delivered', panel_info = ? WHERE id = ?",
-            (panel_info, order_id),
+            """UPDATE orders SET status = 'delivered', panel_info = ?,
+                   panel_username = COALESCE(?, panel_username),
+                   subscription_url = COALESCE(?, subscription_url),
+                   expire_at = COALESCE(?, expire_at)
+               WHERE id = ?""",
+            (panel_info, panel_username, subscription_url, expire_at, order_id),
         )
         await db.commit()
 
@@ -1333,4 +1351,36 @@ async def add_multi_plan_full(
         )
         await db.commit()
         return cur.lastrowid
+
+
+async def list_delivered_orders_for_watch():
+    """سفارش‌های تحویل‌شده با یوزرنیم پنل برای مانیتور حجم/انقضا."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT * FROM orders
+               WHERE status = 'delivered'
+                 AND panel_username IS NOT NULL AND panel_username != ''
+                 AND COALESCE(expired_notified, 0) = 0"""
+        )
+        return await cur.fetchall()
+
+
+async def mark_order_warned(order_id: int) -> None:
+    from datetime import datetime
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE orders SET last_warn_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), order_id),
+        )
+        await db.commit()
+
+
+async def mark_order_expired_notified(order_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE orders SET expired_notified = 1 WHERE id = ?",
+            (order_id,),
+        )
+        await db.commit()
 
