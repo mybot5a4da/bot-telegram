@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import os
 import time
 from time import monotonic
@@ -3362,37 +3363,79 @@ async def run_free_test_cleanup_once() -> int:
 
 
 
-async def run_service_watch_once() -> None:
-    """هشدار حجم کم و اطلاع تمام‌شدن سرویس به کاربر و ادمین."""
+async def _extract_panel_username_from_order(order: dict) -> str | None:
+    uname = (order.get("panel_username") or "").strip()
+    if uname:
+        return uname
+    info = order.get("panel_info") or ""
+    # الگوهای رایج در متن تحویل
+    patterns = [
+        r"نام کاربری سرویس\s*[:：]\s*([A-Za-z0-9_\-\.]+)",
+        r"نام کاربری تست\s*[:：]\s*([A-Za-z0-9_\-\.]+)",
+        r"👤\s*([A-Za-z0-9_\-\.]+)",
+        r"\b(svc_[A-Za-z0-9_\-]+)\b",
+        r"\b(test_?[A-Za-z0-9_\-]+)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, info)
+        if m:
+            return m.group(1)
+    return None
+
+
+async def run_service_watch_once() -> int:
+    """هشدار حجم کم و اطلاع تمام‌شدن سرویس. تعداد اعلان‌ها را برمی‌گرداند."""
     if not config.is_panel_auto_enabled():
-        return
+        logging.warning("service_watch: panel not enabled")
+        return 0
     try:
         import panel as pg
     except Exception:
-        return
+        logging.exception("service_watch: panel import failed")
+        return 0
+
     warn_gb = float(getattr(config, "SERVICE_WARN_REMAINING_GB", 1.0) or 1.0)
     rows = await db.list_delivered_orders_for_watch()
+    notified = 0
     for row in rows:
         try:
             order = dict(row)
         except Exception:
-            order = row
-        uname = order.get("panel_username") if isinstance(order, dict) else None
+            continue
+        uname = await _extract_panel_username_from_order(order)
         if not uname:
             continue
+        # backfill username if missing
+        if not (order.get("panel_username") or "").strip():
+            try:
+                await db.set_order_panel_meta(order["id"], panel_username=uname)
+            except Exception:
+                pass
+
         oid = order["id"]
         uid = order["user_id"]
-        info = await pg.get_panel_user(uname)
+        try:
+            info = await pg.get_panel_user(uname)
+        except Exception as e:
+            logging.warning("get_panel_user %s: %s", uname, e)
+            info = None
+
         local_exp = order.get("expire_at")
+        try:
+            local_exp = int(local_exp) if local_exp else None
+        except Exception:
+            local_exp = None
+
         done, reason = pg.is_panel_user_exhausted(info, local_exp)
         if done:
             await db.mark_order_expired_notified(oid)
+            notified += 1
             try:
                 await bot.send_message(
                     uid,
-                    f"🔴 سرویس سفارش #{oid} تمام شد ({reason}).\n"
+                    f"🔴 سرویس سفارش #{oid} تمام شد ({reason or 'زمان/حجم'}).\n"
                     f"📦 {order.get('plan_name') or ''}\n\n"
-                    f"از «🛒 سرویس‌های من» → شارژ مجدد بزنید و بعد از پرداخت، سرویس جدید بگیرید.",
+                    f"از «🛒 سرویس‌های من» → «🔋 شارژ مجدد» بزنید.",
                 )
             except Exception as e:
                 logging.warning("notify user expired: %s", e)
@@ -3400,11 +3443,11 @@ async def run_service_watch_once() -> None:
                 try:
                     await bot.send_message(
                         admin_id,
-                        f"🔴 سرویس تمام شد — لطفاً از پنل حذف کنید\n"
-                        f"👤 user <code>{uid}</code>\n"
+                        f"🔴 سرویس تمام شد — از پنل حذف کنید\n"
+                        f"👤 <code>{uid}</code>\n"
                         f"🆔 order #{oid}\n"
                         f"🔑 <code>{uname}</code>\n"
-                        f"دلیل: {reason}",
+                        f"دلیل: {reason or '-'}",
                         parse_mode="HTML",
                     )
                 except Exception:
@@ -3412,16 +3455,19 @@ async def run_service_watch_once() -> None:
             continue
 
         left = pg.remaining_traffic_gb(info)
-        if left is None or left > warn_gb:
+        if left is None:
+            continue
+        if left > warn_gb:
             continue
         if order.get("last_warn_at"):
             continue
         await db.mark_order_warned(oid)
+        notified += 1
         try:
             await bot.send_message(
                 uid,
                 f"⚠️ هشدار: از سرویس سفارش #{oid} حدود <b>{left:.2f} گیگ</b> مانده.\n"
-                f"قبل از اتمام، از «🛒 سرویس‌های من» شارژ مجدد کنید.",
+                f"قبل از اتمام از «🛒 سرویس‌های من» شارژ مجدد کنید.",
                 parse_mode="HTML",
             )
         except Exception:
@@ -3438,6 +3484,7 @@ async def run_service_watch_once() -> None:
                 )
             except Exception:
                 pass
+    return notified
 
 
 async def service_watch_loop() -> None:
@@ -3993,6 +4040,25 @@ async def mm_padd_price(message: Message, state: FSMContext):
         hwid_limit=int(uo["hwid_limit"]) if uo else 1,
     )
     await message.answer(f"✅ پلن اضافه شد:\n{label}\n{price:,} تومان", reply_markup=await multi_plans_admin_kb())
+
+
+
+@dp.message(Command("watch_services"))
+async def admin_watch_services(message: Message):
+    """ادمین: بررسی فوری حجم/انقضای سرویس‌ها"""
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    wait = await message.answer("⏳ در حال بررسی سرویس‌های تحویل‌شده...")
+    try:
+        n = await run_service_watch_once()
+        await wait.edit_text(
+            f"✅ بررسی انجام شد.\nتعداد اعلان ارسال‌شده: <b>{n}</b>\n"
+            f"(اگر 0 بود یعنی یا هنوز یوزرنیم پنل ذخیره نشده، یا سرویس‌ها هنوز تمام/کم نشده‌اند.)",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logging.exception("watch_services cmd")
+        await wait.edit_text(f"❌ خطا: <code>{e}</code>", parse_mode="HTML")
 
 
 # ---------- Startup ----------

@@ -570,10 +570,12 @@ async def create_service_account(
     elif not sub:
         message = message.rstrip() + "\n\n⚠️ لینک اشتراک از پنل دریافت نشد."
 
+    expire_ts = int(__import__("time").time()) + int(expire_days) * 86400
     return {
         "username": final_username,
         "subscription_url": sub or "",
         "message": message,
+        "expire_at": expire_ts,
     }
 
 
@@ -663,10 +665,22 @@ def remaining_traffic_gb(user_data: dict[str, Any] | None) -> float | None:
     """حجم باقی‌مانده به گیگ؛ None اگر نامشخص/نامحدود."""
     if not user_data:
         return None
-    data_limit = user_data.get("data_limit")
-    used = user_data.get("used_traffic")
-    if used is None:
-        used = user_data.get("lifetime_used_traffic")
+    data_limit = (
+        user_data.get("data_limit")
+        or user_data.get("dataLimit")
+        or user_data.get("transfer_enable")
+    )
+    used = (
+        user_data.get("used_traffic")
+        or user_data.get("usedTraffic")
+        or user_data.get("lifetime_used_traffic")
+        or user_data.get("download")
+    )
+    # nested traffic object
+    tr = user_data.get("traffic") if isinstance(user_data.get("traffic"), dict) else None
+    if tr:
+        data_limit = data_limit or tr.get("limit") or tr.get("data_limit")
+        used = used if used is not None else tr.get("used") or tr.get("uplink")
     try:
         dl = int(data_limit) if data_limit is not None else 0
         us = int(used) if used is not None else 0

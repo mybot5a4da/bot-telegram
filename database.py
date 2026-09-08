@@ -1354,16 +1354,36 @@ async def add_multi_plan_full(
 
 
 async def list_delivered_orders_for_watch():
-    """سفارش‌های تحویل‌شده با یوزرنیم پنل برای مانیتور حجم/انقضا."""
+    """سفارش‌های تحویل‌شده که هنوز منقضی اعلام نشده‌اند (با یا بدون panel_username)."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             """SELECT * FROM orders
                WHERE status = 'delivered'
-                 AND panel_username IS NOT NULL AND panel_username != ''
-                 AND COALESCE(expired_notified, 0) = 0"""
+                 AND COALESCE(expired_notified, 0) = 0
+               ORDER BY id DESC
+               LIMIT 200"""
         )
         return await cur.fetchall()
+
+
+async def set_order_panel_meta(
+    order_id: int,
+    *,
+    panel_username: str | None = None,
+    subscription_url: str | None = None,
+    expire_at: int | None = None,
+) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE orders SET
+                   panel_username = COALESCE(?, panel_username),
+                   subscription_url = COALESCE(?, subscription_url),
+                   expire_at = COALESCE(?, expire_at)
+               WHERE id = ?""",
+            (panel_username, subscription_url, expire_at, order_id),
+        )
+        await db.commit()
 
 
 async def mark_order_warned(order_id: int) -> None:
