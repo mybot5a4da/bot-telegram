@@ -1863,7 +1863,7 @@ async def multi_users_admin_kb() -> InlineKeyboardMarkup:
     for o in opts:
         st = "✅" if o["active"] else "🚫"
         rows.append([InlineKeyboardButton(
-            text=f"{st} {o['label']} (حد {o['hwid_limit']})",
+            text=f"{st} {o['label']} ({'نامحدود' if int(o['hwid_limit'] or 0) == 0 else 'حد ' + str(o['hwid_limit'])})",
             callback_data=f"mm:uo:{o['id']}",
         )])
         rows.append([
@@ -3040,12 +3040,16 @@ async def _parse_order_panel_spec(order) -> dict:
                     hwid = u["hwid_limit"] if u else 1
                 vol_f = float(vol) if vol is not None else 0.0
                 days_i = int(days) if days else 30
-                hwid_i = int(hwid) if hwid else 1
+                if hwid is None:
+                    hwid_i = 1
+                else:
+                    hwid_i = int(hwid)  # 0 = نامحدود
                 vol_label = f"{vol_f:g} گیگابایت" if vol_f else "نامحدود"
+                users_label = "نامحدود کاربره" if hwid_i == 0 else f"{hwid_i} کاربره"
                 return {
                     "data_limit_gb": vol_f,
                     "expire_days": days_i,
-                    "service_name": f"{hwid_i} کاربره | {vol_label}",
+                    "service_name": f"{users_label} | {vol_label}",
                     "volume_label": vol_label,
                     "duration_label": f"{days_i} روزه",
                     "hwid_limit": hwid_i,
@@ -3916,7 +3920,11 @@ async def mm_uo_label(message: Message, state: FSMContext):
         return
     await state.update_data(muo_label=(message.text or "").strip())
     await state.set_state(AdminStates.adding_multi_user_limit)
-    await message.answer("حداکثر تعداد دستگاه/کاربر (عدد، مثلاً 2):")
+    await message.answer(
+        "حداکثر تعداد کاربر/دستگاه را عدد بفرستید.\n"
+        "۰ = نامحدود (بدون محدودیت روی پنل)\n"
+        "مثلاً: 1 یا 2 یا 0"
+    )
 
 
 @dp.message(AdminStates.adding_multi_user_limit)
@@ -3926,12 +3934,17 @@ async def mm_uo_limit(message: Message, state: FSMContext):
     try:
         lim = int((message.text or "").strip())
     except ValueError:
-        await message.answer("عدد معتبر بفرستید.")
+        await message.answer("عدد معتبر بفرستید. ۰ یعنی نامحدود.")
+        return
+    if lim < 0:
+        await message.answer("عدد منفی مجاز نیست. ۰ = نامحدود.")
         return
     data = await state.get_data()
     await state.clear()
-    await db.add_multi_user_option(data.get("muo_label") or f"{lim} کاربره", lim)
-    await message.answer("✅ اضافه شد.", reply_markup=await multi_users_admin_kb())
+    default_label = "نامحدود کاربره" if lim == 0 else f"{lim} کاربره"
+    await db.add_multi_user_option(data.get("muo_label") or default_label, lim)
+    note = "نامحدود (بدون hwid_limit روی پنل)" if lim == 0 else f"حد {lim} کاربر"
+    await message.answer(f"✅ اضافه شد — {note}", reply_markup=await multi_users_admin_kb())
 
 
 @dp.callback_query(F.data.startswith("mm:uotog:"))
