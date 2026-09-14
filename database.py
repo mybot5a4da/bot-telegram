@@ -1565,3 +1565,42 @@ async def is_service_enabled(kind: str) -> bool:
 
 async def set_service_enabled(kind: str, enabled: bool) -> None:
     await set_setting(f"service_{kind}_enabled", "1" if enabled else "0")
+
+
+async def list_wallets_positive(limit: int = 50):
+    """کاربرانی که موجودی کیف پول > 0 دارند."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT user_id, balance FROM wallets
+               WHERE balance > 0
+               ORDER BY balance DESC
+               LIMIT ?""",
+            (limit,),
+        )
+        return await cur.fetchall()
+
+
+async def set_wallet_balance(user_id: int, balance: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO wallets (user_id, balance) VALUES (?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET balance = excluded.balance""",
+            (user_id, int(balance)),
+        )
+        await db.commit()
+
+
+async def reset_wallet_balance(user_id: int) -> int:
+    """موجودی را صفر می‌کند و مبلغ قبلی را برمی‌گرداند."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT balance FROM wallets WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        old = int(row[0]) if row else 0
+        await db.execute(
+            """INSERT INTO wallets (user_id, balance) VALUES (?, 0)
+               ON CONFLICT(user_id) DO UPDATE SET balance = 0""",
+            (user_id,),
+        )
+        await db.commit()
+        return old

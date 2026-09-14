@@ -1754,6 +1754,8 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📜 ویرایش قوانین", callback_data="adminrules")],
             [InlineKeyboardButton(text="🎟 کدهای تخفیف", callback_data="admincoupons")],
             [InlineKeyboardButton(text="🎁 کدهای هدیه کیف پول", callback_data="admingifts")],
+            [InlineKeyboardButton(text="💰 کیف پول کاربران", callback_data="adminwallets")],
+
 
             [InlineKeyboardButton(text="🤝 تنظیمات رفرال", callback_data="adminreferral")],
             [InlineKeyboardButton(text="💳 تخفیف شارژ کیف پول", callback_data="adminwalletbonus")],
@@ -1788,6 +1790,15 @@ async def tariffs_menu_kb() -> InlineKeyboardMarkup:
                     text=f"{status} 📦 {c['name']}",
                     callback_data=f"admintariff:cat:{c['id']}",
                 )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="⏸ مخفی از خرید" if c["active"] else "▶️ نمایش در خرید",
+                    callback_data=f"tcattoggle:{c['id']}",
+                ),
+                InlineKeyboardButton(text="🗑 حذف", callback_data=f"tcatdelete:{c['id']}"),
             ]
         )
     rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")])
@@ -4437,6 +4448,112 @@ async def gift_add_note(message: Message, state: FSMContext):
         parse_mode="HTML",
         reply_markup=await gift_codes_admin_kb(),
     )
+
+
+
+
+@dp.callback_query(F.data.startswith("svcvis:"))
+async def toggle_service_visibility(callback: CallbackQuery):
+    """نمایش/مخفی کردن گیمینگ یا مولتی در منوی خرید مشتری."""
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    kind = callback.data.split(":")[1]
+    if kind not in ("gaming", "multi"):
+        await callback.answer()
+        return
+    currently = await _service_visible(kind)
+    await db.set_service_enabled(kind, not currently)
+    label = "گیمینگ" if kind == "gaming" else "مولتی"
+    state = "مخفی شد" if currently else "نمایش داده می‌شود"
+    try:
+        await callback.message.edit_text(
+            "📋 <b>مدیریت تعرفه‌ها</b>\n\n"
+            f"✅ وضعیت <b>{label}</b>: {state}",
+            parse_mode="HTML",
+            reply_markup=await tariffs_menu_kb(),
+        )
+    except Exception:
+        await callback.message.answer(
+            f"✅ {label}: {state}",
+            reply_markup=await tariffs_menu_kb(),
+        )
+    await callback.answer(f"{label}: {state}")
+
+
+async def wallets_admin_kb() -> InlineKeyboardMarkup:
+    rows_data = await db.list_wallets_positive(40)
+    rows = []
+    for w in rows_data:
+        uid = w["user_id"]
+        bal = w["balance"]
+        rows.append([
+            InlineKeyboardButton(
+                text=f"👤 {uid} | {bal:,} ت",
+                callback_data=f"walletview:{uid}",
+            ),
+            InlineKeyboardButton(text="🗑 صفر", callback_data=f"walletreset:{uid}"),
+        ])
+    if not rows:
+        rows.append([InlineKeyboardButton(text="(هیچ موجودی مثبتی نیست)", callback_data="noop")])
+    rows.append([InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="adminwallets")])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "adminwallets")
+async def admin_wallets_menu(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    await state.clear()
+    rows = await db.list_wallets_positive(40)
+    total = sum(int(r["balance"]) for r in rows)
+    text = (
+        f"💰 <b>کیف پول کاربران</b>\n"
+        f"تعداد با موجودی: <b>{len(rows)}</b>\n"
+        f"جمع تقریبی (تا ۴۰ نفر اول): <b>{total:,}</b> تومان\n\n"
+        f"روی «صفر» بزنید تا موجودی آن کاربر ۰ شود."
+    )
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=await wallets_admin_kb())
+    except Exception:
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=await wallets_admin_kb())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("walletview:"))
+async def admin_wallet_view(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    uid = int(callback.data.split(":")[1])
+    bal = await db.get_wallet_balance(uid)
+    await callback.answer(f"موجودی {uid}: {bal:,} تومان", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("walletreset:"))
+async def admin_wallet_reset(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    uid = int(callback.data.split(":")[1])
+    old = await db.reset_wallet_balance(uid)
+    try:
+        await bot.send_message(
+            uid,
+            f"ℹ️ موجودی کیف پول شما توسط مدیریت صفر شد.\n(قبلی: {old:,} تومان)",
+        )
+    except Exception:
+        pass
+    await callback.message.edit_text(
+        f"✅ موجودی کاربر <code>{uid}</code> صفر شد.\nقبلی: {old:,} تومان",
+        parse_mode="HTML",
+        reply_markup=await wallets_admin_kb(),
+    )
+    await callback.answer("صفر شد")
+
+
+@dp.callback_query(F.data == "noop")
+async def noop_cb(callback: CallbackQuery):
+    await callback.answer()
 
 
 
