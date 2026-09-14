@@ -156,7 +156,12 @@ class WalletStates(StatesGroup):
     waiting_for_topup_receipt = State()
 
 
+class WalletGiftStates(StatesGroup):
+    entering_gift_code = State()
+
+
 class AdminStates(StatesGroup):
+
     panel_name = State()
     panel_url = State()
     panel_user = State()
@@ -183,7 +188,13 @@ class AdminStates(StatesGroup):
     adding_coupon_code = State()
     adding_coupon_percent = State()
     adding_coupon_maxuses = State()
+    adding_gift_code = State()
+    adding_gift_amount = State()
+    adding_gift_maxuses = State()
+    adding_gift_expires = State()
+    adding_gift_note = State()
     editing_wallet_bonus_threshold = State()
+
     editing_wallet_bonus_percent = State()
     waiting_for_backup_upload = State()
     adding_multi_duration_label = State()
@@ -236,12 +247,26 @@ def back_menu_kb() -> InlineKeyboardMarkup:
     )
 
 
+async def _service_visible(kind: str) -> bool:
+    """نمایش گیمینگ/مولتی: setting دیتابیس اولویت دارد؛ اگر نبود از env."""
+    key = f"service_{kind}_enabled"
+    val = await db.get_setting(key)
+    if val is not None:
+        return str(val).strip() not in ("0", "false", "False", "no", "")
+    if kind == "gaming":
+        return bool(getattr(config, "SERVICE_GAMING_ENABLED", True))
+    if kind == "multi":
+        return bool(getattr(config, "SERVICE_MULTI_ENABLED", True))
+    return True
+
+
 async def services_kb() -> InlineKeyboardMarkup:
-    """منوی خرید: گیمینگ + مولتی + دسته‌های سفارشی فعال که حداقل یک پلن فعال دارند."""
-    rows = [
-        [InlineKeyboardButton(text="🎮 سرویس گیمینگ", callback_data="svc:gaming")],
-        [InlineKeyboardButton(text="🌍 مولتی لوکیشن", callback_data="svc:multi")],
-    ]
+    """منوی خرید: فقط سرویس‌های فعال + دسته‌های سفارشی."""
+    rows = []
+    if await _service_visible("gaming"):
+        rows.append([InlineKeyboardButton(text="🎮 سرویس گیمینگ", callback_data="svc:gaming")])
+    if await _service_visible("multi"):
+        rows.append([InlineKeyboardButton(text="🌍 مولتی لوکیشن", callback_data="svc:multi")])
     cats = await db.get_tariff_categories(active_only=True)
     for c in cats:
         plans = await db.get_tariff_plans(c["id"], active_only=True)
@@ -568,6 +593,9 @@ async def cancel_order_and_go_back(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "svc:gaming")
 async def choose_gaming_service(callback: CallbackQuery, state: FSMContext):
+    if not await _service_visible("gaming"):
+        await callback.answer("این سرویس در حال حاضر فعال نیست.", show_alert=True)
+        return
     plans = await db.get_gaming_plans()
     if not plans:
         await callback.answer("در حال حاضر تعرفه‌ای برای این سرویس ثبت نشده.", show_alert=True)
@@ -1438,6 +1466,7 @@ async def wallet_handler(message: Message, state: FSMContext):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="➕ شارژ کیف پول", callback_data="topupwallet")],
+            [InlineKeyboardButton(text="🎁 وارد کردن کد هدیه", callback_data="redeemgift")],
             [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back:menu")],
         ]
     )
@@ -1724,6 +1753,8 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="✉️ پیام خوش‌آمدگویی", callback_data="adminwelcome")],
             [InlineKeyboardButton(text="📜 ویرایش قوانین", callback_data="adminrules")],
             [InlineKeyboardButton(text="🎟 کدهای تخفیف", callback_data="admincoupons")],
+            [InlineKeyboardButton(text="🎁 کدهای هدیه کیف پول", callback_data="admingifts")],
+
             [InlineKeyboardButton(text="🤝 تنظیمات رفرال", callback_data="adminreferral")],
             [InlineKeyboardButton(text="💳 تخفیف شارژ کیف پول", callback_data="adminwalletbonus")],
             [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back:menu")],
@@ -1733,9 +1764,19 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
 
 async def tariffs_menu_kb() -> InlineKeyboardMarkup:
     """زیرمنوی تعرفه‌ها: افزودن دسته + گیمینگ + مولتی + دسته‌های سفارشی."""
+    g_on = await _service_visible("gaming")
+    m_on = await _service_visible("multi")
     rows = [
         [InlineKeyboardButton(text="➕ افزودن دسته تعرفه (اسم دلخواه)", callback_data="admintariff:addcat")],
+        [InlineKeyboardButton(
+            text=("✅ نمایش گیمینگ در خرید" if g_on else "🚫 گیمینگ مخفی از خرید"),
+            callback_data="svcvis:gaming",
+        )],
         [InlineKeyboardButton(text="🎮 تعرفه‌های گیمینگ", callback_data="admintariff:gaming")],
+        [InlineKeyboardButton(
+            text=("✅ نمایش مولتی در خرید" if m_on else "🚫 مولتی مخفی از خرید"),
+            callback_data="svcvis:multi",
+        )],
         [InlineKeyboardButton(text="🌍 تعرفه‌های مولتی لوکیشن", callback_data="admintariff:multi")],
     ]
     cats = await db.get_tariff_categories(active_only=False)
@@ -4156,6 +4197,247 @@ async def admin_watch_services(message: Message):
     except Exception as e:
         logging.exception("watch_services cmd")
         await wait.edit_text(f"❌ خطا: <code>{e}</code>", parse_mode="HTML")
+
+
+
+# ---------- کد هدیه کیف پول (کاربر) ----------
+@dp.callback_query(F.data == "redeemgift")
+async def start_redeem_gift(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(WalletGiftStates.entering_gift_code)
+    await callback.message.answer(
+        "🎁 کد هدیه را وارد کنید:\n"
+        "(فقط حروف و عدد، بدون فاصله)",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔙 انصراف", callback_data="cancelgift")]]
+        ),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "cancelgift")
+async def cancel_gift(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("لغو شد.", reply_markup=main_menu_kb(callback.from_user.id))
+    await callback.answer()
+
+
+@dp.message(WalletGiftStates.entering_gift_code)
+async def receive_gift_code(message: Message, state: FSMContext):
+    code = (message.text or "").strip()
+    if not code or code.startswith("/"):
+        await message.answer("کد معتبر بفرستید یا /cancel")
+        return
+    if code.lower() in ("/cancel", "cancel", "انصراف"):
+        await state.clear()
+        await message.answer("لغو شد.", reply_markup=main_menu_kb(message.from_user.id))
+        return
+    ok, msg, amount = await db.redeem_gift_code(code, message.from_user.id)
+    await state.clear()
+    balance = await db.get_wallet_balance(message.from_user.id)
+    if ok:
+        await message.answer(
+            msg + f"\n\n💰 موجودی فعلی: <b>{balance:,}</b> تومان",
+            parse_mode="HTML",
+            reply_markup=main_menu_kb(message.from_user.id),
+        )
+        for admin_id in config.ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🎁 کد هدیه استفاده شد\n"
+                    f"کد: <code>{code.strip().upper()}</code>\n"
+                    f"👤 {message.from_user.full_name} (<code>{message.from_user.id}</code>)\n"
+                    f"💰 {amount:,} تومان",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+    else:
+        await message.answer(msg, reply_markup=main_menu_kb(message.from_user.id))
+
+
+# ---------- Admin: کد هدیه ----------
+async def gift_codes_admin_kb() -> InlineKeyboardMarkup:
+    codes = await db.list_gift_codes()
+    rows = []
+    for g in codes[:30]:
+        st = "✅" if g["active"] else "🚫"
+        uses = f"{g['used_count']}/{g['max_uses'] if g['max_uses'] is not None else '∞'}"
+        exp = g["expires_at"] or "بدون انقضا"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{st} {g['code']} | {g['amount']:,}ت | {uses}",
+                callback_data=f"giftview:{g['code']}",
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(text="⏸/▶️", callback_data=f"gifttog:{g['code']}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"giftdel:{g['code']}"),
+        ])
+    rows.append([InlineKeyboardButton(text="➕ ساخت کد هدیه", callback_data="giftadd")])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "admingifts")
+async def admin_gifts_menu(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "🎁 <b>کدهای هدیه کیف پول</b>\n"
+        "کاربر از کیف پول → وارد کردن کد هدیه استفاده می‌کند.",
+        parse_mode="HTML",
+        reply_markup=await gift_codes_admin_kb(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("gifttog:"))
+async def gift_toggle(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    code = callback.data.split(":", 1)[1]
+    await db.toggle_gift_code_active(code)
+    await callback.message.edit_reply_markup(reply_markup=await gift_codes_admin_kb())
+    await callback.answer("وضعیت عوض شد")
+
+
+@dp.callback_query(F.data.startswith("giftdel:"))
+async def gift_delete(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    code = callback.data.split(":", 1)[1]
+    await db.delete_gift_code(code)
+    await callback.message.edit_text(
+        "🎁 کدهای هدیه:",
+        reply_markup=await gift_codes_admin_kb(),
+    )
+    await callback.answer("حذف شد")
+
+
+@dp.callback_query(F.data == "giftadd")
+async def gift_add_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    await state.set_state(AdminStates.adding_gift_code)
+    await callback.message.answer(
+        "کد هدیه را بفرستید (انگلیسی/عدد، مثال: GIFT50K):"
+    )
+    await callback.answer()
+
+
+@dp.message(AdminStates.adding_gift_code)
+async def gift_add_code(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    code = (message.text or "").strip().upper().replace(" ", "")
+    if not code.isalnum():
+        await message.answer("فقط حروف و عدد، بدون فاصله.")
+        return
+    await state.update_data(gift_code=code)
+    await state.set_state(AdminStates.adding_gift_amount)
+    await message.answer("مبلغ هدیه به تومان (عدد، مثال: 50000):")
+
+
+@dp.message(AdminStates.adding_gift_amount)
+async def gift_add_amount(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    raw = (message.text or "").replace(",", "").replace("،", "").strip()
+    try:
+        amount = int(raw)
+    except ValueError:
+        await message.answer("عدد معتبر بفرستید.")
+        return
+    if amount <= 0:
+        await message.answer("مبلغ باید بیشتر از صفر باشد.")
+        return
+    await state.update_data(gift_amount=amount)
+    await state.set_state(AdminStates.adding_gift_maxuses)
+    await message.answer(
+        "چند نفر می‌توانند استفاده کنند؟\n"
+        "عدد بفرستید یا 0 برای نامحدود:"
+    )
+
+
+@dp.message(AdminStates.adding_gift_maxuses)
+async def gift_add_maxuses(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    try:
+        n = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("عدد بفرستید (0 = نامحدود).")
+        return
+    max_uses = None if n <= 0 else n
+    await state.update_data(gift_max=max_uses)
+    await state.set_state(AdminStates.adding_gift_expires)
+    await message.answer(
+        "چند روز این کد فعال باشد؟\n"
+        "مثال: 5  یعنی تا ۵ روز دیگر\n"
+        "0  یعنی بدون انقضا"
+    )
+
+
+@dp.message(AdminStates.adding_gift_expires)
+async def gift_add_expires(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    from datetime import datetime, timedelta
+    raw = (message.text or "").strip()
+    try:
+        days = int(raw)
+    except ValueError:
+        await message.answer("عدد روز را بفرستید (مثلاً 5 یا 0).")
+        return
+    if days < 0:
+        await message.answer("عدد منفی مجاز نیست.")
+        return
+    expires = None
+    exp_label = "بدون انقضا"
+    if days > 0:
+        exp_dt = datetime.now() + timedelta(days=days)
+        expires = exp_dt.strftime("%Y-%m-%d")
+        exp_label = f"{days} روز (تا {expires})"
+    await state.update_data(gift_exp=expires, gift_exp_label=exp_label)
+    await state.set_state(AdminStates.adding_gift_note)
+    await message.answer(
+        "متن دلخواه که بعد از وارد کردن کد به کاربر نشان داده شود:\n"
+        "(یا - برای بدون متن)"
+    )
+
+
+@dp.message(AdminStates.adding_gift_note)
+async def gift_add_note(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    note = (message.text or "").strip()
+    if note in ("-", "0", "."):
+        note = ""
+    data = await state.get_data()
+    await state.clear()
+    code = data.get("gift_code")
+    amount = int(data.get("gift_amount") or 0)
+    max_uses = data.get("gift_max")
+    expires = data.get("gift_exp")
+    ok = await db.create_gift_code(code, amount, max_uses, expires, note)
+    if not ok:
+        await message.answer("❌ این کد از قبل وجود دارد.")
+        return
+    usage = "نامحدود" if max_uses is None else str(max_uses)
+    exp_txt = data.get("gift_exp_label") or expires or "بدون انقضا"
+    await message.answer(
+        f"✅ کد هدیه ساخته شد\n"
+        f"🎁 <code>{code}</code>\n"
+        f"💰 {amount:,} تومان\n"
+        f"👥 ظرفیت: {usage}\n"
+        f"📅 انقضا: {exp_txt}\n"
+        f"📝 {note or '-'}",
+        parse_mode="HTML",
+        reply_markup=await gift_codes_admin_kb(),
+    )
+
 
 
 # ---------- Startup ----------

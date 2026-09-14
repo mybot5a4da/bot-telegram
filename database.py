@@ -182,6 +182,32 @@ async def init_db():
             )
             """
         )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gift_codes (
+                code TEXT PRIMARY KEY,
+                amount INTEGER NOT NULL,
+                max_uses INTEGER,
+                used_count INTEGER NOT NULL DEFAULT 0,
+                expires_at TEXT,
+                note TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gift_code_redemptions (
+                code TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                redeemed_at TEXT,
+                PRIMARY KEY (code, user_id)
+            )
+            """
+        )
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS referral_commissions (
@@ -1404,3 +1430,138 @@ async def mark_order_expired_notified(order_id: int) -> None:
         )
         await db.commit()
 
+
+
+# ---------- کد هدیه کیف پول ----------
+async def create_gift_code(
+    code: str,
+    amount: int,
+    max_uses: int | None,
+    expires_at: str | None,
+    note: str = "",
+) -> bool:
+    from datetime import datetime
+    code = code.strip().upper()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT code FROM gift_codes WHERE code = ?", (code,))
+        if await cur.fetchone():
+            return False
+        await db.execute(
+            """INSERT INTO gift_codes (code, amount, max_uses, used_count, expires_at, note, active, created_at)
+               VALUES (?, ?, ?, 0, ?, ?, 1, ?)""",
+            (code, amount, max_uses, expires_at, note or "", datetime.now().isoformat()),
+        )
+        await db.commit()
+        return True
+
+
+async def get_gift_code(code: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM gift_codes WHERE code = ?", (code.strip().upper(),))
+        return await cur.fetchone()
+
+
+async def list_gift_codes():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM gift_codes ORDER BY created_at DESC")
+        return await cur.fetchall()
+
+
+async def toggle_gift_code_active(code: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE gift_codes SET active = 1 - active WHERE code = ?",
+            (code.strip().upper(),),
+        )
+        await db.commit()
+
+
+async def delete_gift_code(code: str) -> None:
+    code = code.strip().upper()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM gift_code_redemptions WHERE code = ?", (code,))
+        await db.execute("DELETE FROM gift_codes WHERE code = ?", (code,))
+        await db.commit()
+
+
+async def has_redeemed_gift_code(code: str, user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM gift_code_redemptions WHERE code = ? AND user_id = ?",
+            (code.strip().upper(), user_id),
+        )
+        return await cur.fetchone() is not None
+
+
+async def redeem_gift_code(code: str, user_id: int) -> tuple[bool, str, int]:
+    """(موفق؟, پیام, مبلغ)"""
+    from datetime import datetime
+
+    code = code.strip().upper()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM gift_codes WHERE code = ?", (code,))
+        row = await cur.fetchone()
+        if not row:
+            return False, "❌ این کد هدیه معتبر نیست.", 0
+        if not row["active"]:
+            return False, "❌ این کد هدیه غیرفعال شده است.", 0
+        exp = row["expires_at"]
+        if exp:
+            try:
+                exp_s = str(exp).strip()
+                if len(exp_s) == 10:
+                    exp_dt = datetime.strptime(exp_s, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+                else:
+                    exp_dt = datetime.fromisoformat(exp_s)
+                if datetime.now() > exp_dt:
+                    return False, "❌ مهلت این کد هدیه تمام شده است.", 0
+            except Exception:
+                pass
+        max_uses = row["max_uses"]
+        used = int(row["used_count"] or 0)
+        if max_uses is not None and used >= int(max_uses):
+            return False, "❌ ظرفیت استفاده از این کد تمام شده است.", 0
+        cur2 = await db.execute(
+            "SELECT 1 FROM gift_code_redemptions WHERE code = ? AND user_id = ?",
+            (code, user_id),
+        )
+        if await cur2.fetchone():
+            return False, "❌ شما قبلاً از این کد استفاده کرده‌اید.", 0
+
+        amount = int(row["amount"])
+        note = row["note"] or ""
+        await db.execute(
+            "INSERT INTO gift_code_redemptions (code, user_id, amount, redeemed_at) VALUES (?, ?, ?, ?)",
+            (code, user_id, amount, datetime.now().isoformat()),
+        )
+        await db.execute(
+            "UPDATE gift_codes SET used_count = used_count + 1 WHERE code = ?",
+            (code,),
+        )
+        await db.execute(
+            """INSERT INTO wallets (user_id, balance) VALUES (?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?""",
+            (user_id, amount, amount),
+        )
+        await db.commit()
+        msg = f"✅ کد هدیه با موفقیت اعمال شد.\n💰 {amount:,} تومان به کیف پولت اضافه شد."
+        if note:
+            msg += f"\n\n📝 {note}"
+        return True, msg, amount
+
+
+
+async def is_service_enabled(kind: str) -> bool:
+    """kind: gaming | multi — پیش‌فرض از env در لایه bot چک می‌شود اگر setting نباشد."""
+    key = f"service_{kind}_enabled"
+    val = await get_setting(key)
+    if val is None:
+        return True  # پیش‌فرض روشن؛ bot با config override می‌کند
+    return str(val).strip() not in ("0", "false", "False", "no", "")
+
+
+async def set_service_enabled(kind: str, enabled: bool) -> None:
+    await set_setting(f"service_{kind}_enabled", "1" if enabled else "0")

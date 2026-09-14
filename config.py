@@ -215,3 +215,7 @@ CASHBACK_ENABLED = os.getenv("CASHBACK_ENABLED", "1").strip() not in ("0", "fals
 CASHBACK_MIN_GB = float(os.getenv("CASHBACK_MIN_GB", "20"))
 CASHBACK_PERCENT = float(os.getenv("CASHBACK_PERCENT", "5"))
 CASHBACK_ON_UNLIMITED = os.getenv("CASHBACK_ON_UNLIMITED", "1").strip() not in ("0", "false", "False", "no")
+
+# نمایش سرویس‌ها در منوی خرید (1=نشان بده، 0=مخفی)
+SERVICE_GAMING_ENABLED = os.getenv("SERVICE_GAMING_ENABLED", "1").strip() not in ("0", "false", "False", "no")
+SERVICE_MULTI_ENABLED = os.getenv("SERVICE_MULTI_ENABLED", "1").strip() not in ("0", "false", "False", "no")
